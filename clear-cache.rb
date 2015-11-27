@@ -6,59 +6,42 @@ class ClearCache
   include FileUtils
 
   def init()
+    @dry_run = false
+    # munge_data
+    #ban_urls_from_white_list
 
-    ban_urls_from_white_list
-
-    #ban_search_objects_by_build_from_all_caches(false)
-    # ban_brochure_objects_by_build_from_all_caches
-
-  end
-
-  def ban_brochure_objects_by_build_from_all_caches(dublin_only=true)
-
-    builds_to_ban = "104c|fcc9|dabf|b2ce|b734|b3b5|2ff8|fa59|1b2e|e982|4841|7f09|b059|bf5a|bd86|b786"
-    ban_objects_by_build_from_all_caches(builds_to_ban, "brochure", dublin_only)
+    ban_search_objects_by_build_from_all_caches(false)
+    ban_brochure_objects_by_build_from_all_caches(false)
 
   end
 
-  def ban_search_objects_by_build_from_all_caches(dublin_only=true)
+  def munge_data
+    # brochure_urls_with_countries = read_file_to_array("data/BrochurePagesCut.csv", true)
+    # brochure_urls_with_countries.each do |url|
+    #   puts url
+    # end
 
-    builds_to_ban = "b43a"
-    ban_objects_by_build_from_all_caches(builds_to_ban, "search", dublin_only)
+    CSV.foreach("data/BrochurePagesCut.csv") do |row|
 
-  end
-
-  def ban_objects_by_build_from_all_caches(builds_to_ban, object_type, dublin_only=true)
-
-    if (dublin_only)
-      servers = ["dublin"]
-    else
-      servers = ["dublin", "virginia", "california", "sydney", "singapore"]
-    end
-
-    puts "banning (#{builds_to_ban}) for #{object_type} from #{servers.join(",")}"
-
-    servers.each do |server|
-      cmd = "curl -X POST 'http://#{server}.en.prod.varnish.whatclinic.com/varnish/api/v2/ban/by-header/X-WCC-Tags/with-value/(|.*,)buildNumber=(#{builds_to_ban}),.*pageType=#{object_type}(,.*|)'"
-      system(cmd)
+      puts row
     end
   end
 
   def ban_urls_from_white_list
 
     puts "--- reading urls ---"
-    urls = read_file_to_array("data/urls_to_clear.db", true)
-    urls = urls[0..50000]
+    urls_with_countries = read_file_to_array("data/urls_to_clear.db", true)
+    urls_with_countries = urls_with_countries[37..1000]
 
     puts "--- splitting urls ---"
 
-    thread_count = 2
+    thread_count = 3
     threads = []
-    url_holder = Array.new(thread_count) { |i| [] }
+    holder = Array.new(thread_count) { |i| [] }
 
     # round robin the urls into a set per thread
-    urls.each_with_index do |url, index|
-      url_holder[index % (thread_count)] << url
+    urls_with_countries.each_with_index do |url, index|
+      holder[index % (thread_count)] << url
     end
 
     puts "--- starting #{thread_count} threads ---"
@@ -67,11 +50,22 @@ class ClearCache
     thread_count.times do |thread_id|
       threads[thread_id] = Thread.new {
         @thread_id = thread_id
-        refresh_and_ban_urls(url_holder[thread_id])
+        refresh_and_ban_urls(holder[thread_id])
       }
     end
 
     threads.each { |t| t.join }
+
+
+  end
+
+  def execute_cmd(cmd)
+
+    if @dry_run
+      puts "DRY RUN:: #{cmd[0..255]}"
+    else
+      system(cmd)
+    end
 
 
   end
@@ -85,22 +79,29 @@ class ClearCache
   #
   # end
 
-  def refresh_and_ban_urls(urls)
+  def refresh_and_ban_urls(urls_with_countries)
 
     time_started = Time.now
     interval = Time.now
 
     counter = 0
-    urls.each do |url|
-      url.strip!
+    urls_with_countries.each do |url_with_country|
+      url_with_country.strip!
 
-      # put the newest version of the url in the dublin cache
-      hit_url_as_google_bot(url, true)
+      # hacky parsing of urls in file .. sometimes countries are in an array ... sometimes not
+      if(!url_with_country.include?("\""))
+        parts = url_with_country.split(",")
+        url = parts[0]
+        countries = parts[1].split(",")
+      else
+        url =url_with_country.split(",")[0]
+        countries = url_with_country.split("\"")[1].split(",")
+      end
 
-      # ban the url from all edge servers
-      ban_url_from_edge_servers(url)
+      # put the newest version of the url from all popular countries in the cache
+      refresh_url(url, countries)
 
-      log_to_file("urls-cleared-#{Thread.current.object_id}", url, false)
+      log_to_file("urls-cleared-#{Thread.current.object_id}", url_with_country, false)
 
       # this is just timing and output stuff
       counter = counter + 1
@@ -119,32 +120,97 @@ class ClearCache
 
     edge_servers.each do |server|
       curl_to_ban = "curl -s -S -f -X POST 'http://#{server}.en.prod.varnish.whatclinic.com/varnish/api/v2/ban/by-page/#{url}'"
-      system(curl_to_ban)
+      execute_cmd(curl_to_ban)
     end
   end
 
   #
   # hits the url pretending to a google bot
   #
-  def hit_url_as_google_bot(url, force_refresh=false)
+  def refresh_url(url, countries)
 
-    url = "http://www.whatclinic.com/#{url}" unless url.include? "whatclinic.com"
-    country = url.split(/\/|\?/)[4]
+    url.sub!("/","") # remove leading slash
+    country = url.split(/\/|\?/)[1]
 
-    country_code = get_country_mapping[country];
+    # add the home country if it's not there already
 
-    cmd = build_cmd(url, country_code, "D", force_refresh)
-    system(cmd)
+    home_country_code = get_country_mapping[country];
+    countries.push(home_country_code).uniq!
 
-    cmd = build_cmd(url, country_code, "M", force_refresh)
-    system(cmd)
+    edge_servers = ["california", "sydney"]
+    edge_servers.each do |edge_server|
+      full_url = "http://#{edge_server}.en.prod.varnish.whatclinic.com/#{url}"
+      countries.each do |country|
+        puts "#{url} #{edge_server} #{country}"
+        execute_cmd(build_refresh_cmd(full_url, country, "D"))
+        execute_cmd(build_refresh_cmd(full_url, country, "M"))
+
+      end
+
+    end
+
     puts "#{ Thread.current.object_id} completed #{url}"
 
   end
 
-  def build_cmd(url, country, device, force_refresh)
-    force_header = force_refresh ? "-H 'X-Varnish-Refresh: true'" : ""
-    "curl #{url} -o /dev/null -s -H 'Cookie: cc=#{country};cd=#{device}' -A 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' #{force_header} -H 'Accept-Encoding: gzip'"
+  def build_refresh_cmd(url, country, device)
+
+    force_header =  "-H 'X-Varnish-Refresh: true'"
+    "curl #{url} -o /dev/null -s -H 'Host: www.whatclinic.com' -H 'Cookie: cc=#{country};cd=#{device}' -A 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' #{force_header} -H 'Accept-Encoding: gzip'"
+  end
+
+
+  def ban_brochure_objects_by_build_from_all_caches(dublin_only=true)
+
+    # builds_to_ban = "29c0|00a0|107f|3d3d|33d2|0b74|dae2|fcc9|5248|b2ce|b734|104c|e982|4841|f8b3|fa59|b059|bd86"
+    # builds_to_ban = "d34b|b43a|7d8b|04f1|76d8|461a"
+    #builds_to_ban = "18ca|b631"
+    # builds_to_ban = "d60e"
+    # builds_to_ban = "3b20"
+    # builds_to_ban = "6c6e"
+    # builds_to_ban = "a930"
+    # builds_to_ban = "d052"
+    # builds_to_ban = "51d4"
+    # builds_to_ban = "a067"
+    builds_to_ban = "5261"
+    ban_objects_by_build_from_all_caches(builds_to_ban, "brochure", dublin_only)
+
+  end
+
+  def ban_search_objects_by_build_from_all_caches(dublin_only=true)
+
+    # builds_to_ban = "29c0|00a0|107f|3d3d|33d2|0b74|dae2|fcc9|5248|b2ce|b734|104c|e982|4841|f8b3|fa59|b059|bd86"
+    # builds_to_ban = "d34b|b43a|7d8b|04f1|76d8|461a"
+    #builds_to_ban = "18ca|b631"
+    # builds_to_ban = "d60e"
+    # builds_to_ban = "3b20"
+    # builds_to_ban = "6c6e"
+    # builds_to_ban = "a930"
+    # builds_to_ban = "d052"
+    # builds_to_ban = "51d4"
+    # builds_to_ban = "a067"
+    builds_to_ban = "5261"
+
+
+    ban_objects_by_build_from_all_caches(builds_to_ban, "search", dublin_only)
+
+  end
+
+  def ban_objects_by_build_from_all_caches(builds_to_ban, object_type, dublin_only=true)
+
+    if (dublin_only)
+      servers = ["dublin"]
+    else
+      servers = ["dublin", "virginia", "california", "sydney", "singapore"]
+    end
+
+    puts "banning (#{builds_to_ban}) for #{object_type} from #{servers.join(",")}"
+
+    servers.each do |server|
+      cmd = "curl -X POST 'http://#{server}.en.prod.varnish.whatclinic.com/varnish/api/v2/ban/by-header/X-WCC-Tags/with-value/(|.*,)buildNumber=(#{builds_to_ban}),.*pageType=#{object_type}(,.*|)'"
+      system(cmd)
+
+    end
   end
 
 
